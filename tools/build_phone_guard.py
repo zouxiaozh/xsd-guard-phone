@@ -8,7 +8,7 @@
   python build_phone_guard.py                    # 产出自签名 XsdGuardPhone.apk
   python build_phone_guard.py --embed-adbkey    # 内置本机 ~/.android/adbkey，盒子免授权弹窗
   python build_phone_guard.py --adb-test        # 先跑纯 Java 核心连真实盒子自检
-  python build_phone_guard.py --adb-test 192.168.1.100:5555
+  python build_phone_guard.py --adb-test 192.168.31.9:5555
 
 注意：MiBOX4 的 adbd 同时只允许一个 ADB 传输连接，--adb-test 会临时
 kill-server 并在结束后重新 connect，避免与电脑上的守护脚本抢连接。
@@ -118,6 +118,9 @@ def check_compat():
     with open(os.path.join(SRC, "com", "xsdanser", "guard", "GuardState.java"),
               "r", encoding="utf-8") as f:
         st = f.read()
+    with open(os.path.join(SRC, "com", "xsdanser", "guard", "GuardTask.java"),
+              "r", encoding="utf-8") as f:
+        gt = f.read()
     checks = [
         ("minSdk 21", 'minSdkVersion="21"' in mf),
         ("TV launcher", "LEANBACK_LAUNCHER" in mf),
@@ -133,7 +136,7 @@ def check_compat():
         ("日志倒序", "MEM.size() - 1; i >= 0; i--" in lg),
         ("失败计数", "GuardState.fails++" in gs),
         # v2.1 四项 UI 需求，防止后续改动被回退
-        ("默认设备", 'DEFAULT_DEVICES = "电视|192.168.1.100:5555|1"' in gp),
+        ("默认设备", 'DEFAULT_DEVICES = "小米电视|192.168.31.9:5555|1"' in gp),
         ("配置自动保存", all(k in ma for k in
                        ("addTextChangedListener", "postDelayed(saveTask", "onPause()"))),
         ("设备单行", "setMaxLines(1)" in ma and "setHorizontallyScrolling(true)" in ma),
@@ -210,19 +213,93 @@ def check_compat():
         ("深色和谐主题", all(k in ma for k in
                    ("BG = 0xFF0E1720", "BRAND = 0xFF14B8A6", "GradientDrawable",
                     "styleButton", "setTextColor", "setStatusBarColor"))),
-        # v2.13 电视已装学时兑时安装步骤可跳过：连接后自动检测 + 按钮降级提示 + 步骤文字标注
+        # v2.13→v3 电视已装任务 App 时安装步骤可跳过：连接后自动检测 + 按钮降级提示
         ("已装可跳过安装", all(k in gs for k in
-                   ("probeTvInstalled", "GuardState.tvInstalled", "pm path ",
-                    "电视已安装学时兑：可跳过安装"))
+                   ("probeTvInstalled", "setTaskInstalled", "pm path ",
+                    "可跳过安装"))
                    and all(k in ma for k in
-                   ("电视已装可跳过", "学时兑已安装 · 可跳过", "GuardState.tvInstalled"))
-                   and "tvInstalled" in st),
+                   ("可跳过", "taskInstalled"))
+                   and "taskInstalled" in st),
         # v2.14 守护中检测学时兑是否被删：被删自动补装 + 唤醒（带冷却，失败不空转）
         ("被删自动补装", all(k in gs for k in
                    ("healReinstall", "HEAL_COOLDOWN_MS", "自动补装完成",
                     "已自动补装并唤醒", "GuardState.reinstalls++"))
                    and all(k in tv for k in ("installState", "pm list packages "))
                    and "reinstalls" in st),
+        # v3.0 通用守护：任务模型 / 任务存储 / 两种安装包来源 / 本地选包 / 任务管理界面
+        ("通用任务模型", all(k in gt for k in
+                     ("class GuardTask", "SRC_LOCAL", "autoInstall()",
+                      "remotePath()", "validPkg", "defaultTask"))),
+        ("任务配置存储", all(k in gp for k in
+                     ("tasks_v3", "setTasks(", "tasks()", "defaultTask"))),
+        ("按任务驱动", all(k in gs for k in
+                     ("selectedTasks(", "taskById(", "setTaskInstalled",
+                      "healReinstall(d, crypto, ttag, t)"))),
+        ("固定网址来源", all(k in gs for k in
+                     ("prepareApk", "HttpURLConnection", "APK_URL"))),
+        ("本地选包推送", all(k in ma for k in
+                     ("OPEN_DOCUMENT", "takePersistableUriPermission", "选择本地 APK"))
+                     and "SRC_LOCAL" in gt and "openInputStream" in gs),
+        ("任务管理界面", all(k in ma for k in
+                     ("rebuildTaskList", "saveTaskConfig", "REQ_PICK_APK",
+                      "taskInstalled"))),
+        ("App名称与版本门禁", 'versionCode="27"' in mf and 'versionName="3.7"' in mf
+                     and 'android:label="学时兑守护"' in mf),
+        # v3.1 查询电视第三方包名 + 复制：服务动作 / pm -3 命令 / 解析 / 共享状态 / UI 按钮与剪贴板
+        ("查询第三方包名", all(k in gs for k in
+                     ("ACTION_LIST_PKGS", "pm list packages -3", "queryPackages",
+                      "thirdPartyPkgs", "GuardState.pkgQueryHint"))
+                     and "thirdPartyPackages" in tv
+                     and "thirdPartyPkgs" in st),
+        ("复制包名到剪贴板", all(k in ma for k in
+                     ("查询电视应用包名", "rebuildPkgList", "ClipboardManager",
+                      "setPrimaryClip", "copyPkg", "Toast.makeText"))),
+        ("任务级安装权限已取消", ("已配置任务" in ma)
+                     and ma.count("ACTION_INSTALL, t.id") == 0
+                     and ma.count("ACTION_GRANT, t.id") == 0),
+        # v3.2 本地选包：放开 MIME 过滤（APK 发灰点不动）+ 每一步可见反馈 + 文件名校验
+        ("本地选包点击修复", all(k in ma for k in
+                     ('pick.setType("*/*")', "displayName(", "已打开系统文件选择器",
+                      "未选择文件（已取消）", "文件名不是 .apk 结尾"))
+                     and 'takePersistableUriPermission' in ma),
+        # v3.4 默认任务仍不可删除，但按钮文字精简为「默认」、去掉「不可删」字样；
+        # 三个操作按钮改用紧凑样式 taskButton + lpTaskBtn。
+        ("默认任务不可删除", 'DEFAULT_ID = "xsd"' in gt
+                     and "new GuardTask(DEFAULT_ID" in gt
+                     and 'GuardTask.DEFAULT_ID.equals(t.id)' in ma
+                     and 'taskButton("默认", null)' in ma
+                     and 'btnLocked.setEnabled(false)' in ma
+                     and '默认·不可删' not in ma),
+        ("任务按钮紧凑化", 'private Button taskButton(' in ma
+                     and 'private LinearLayout.LayoutParams lpTaskBtn(' in ma
+                     and ma.count('taskButton(') >= 4
+                     and ma.count('lpTaskBtn()') >= 4),
+        # v3.5 任务标题去括号 / 列表外观分层 / 查询包名按钮按 ADB 状态灰显 / 说明重写
+        ("任务标题去括号", 'label("已配置任务")' in ma
+                     and '已配置任务（' not in ma),
+        ("任务列表外观优化", all(k in ma for k in
+                     ("headRow.setGravity(Gravity.CENTER_VERTICAL", "pkg.setText(t.pkg)",
+                      "row.setGravity(Gravity.RIGHT)", "dot.setText(t.enabled"))
+                     and 'import android.view.Gravity;' in ma),
+        ("查询按钮灰显联动", 'btnQueryPkgs' in ma
+                     and 'btnQueryPkgs.setEnabled(GuardState.adbOk)' in ma
+                     and '查询电视应用包名（先连接 ADB）' in ma
+                     and '请先连接 ADB 再查询电视应用包名' in ma),
+        ("说明开头定位", '本 App 除了为「学时兑」App 提供守护' in ma
+                     and '也可以为其他类似的 TV / 盒子 App 提供守护服务' in ma),
+        # v3.6 通过 ADB 自动开通通知使用权（复活监听），被清理后系统自动重绑秒级复活
+        ("通知监听自动授权", all(k in gs for k in
+                     ("grantNotificationListener", "cmd notification allow_listener",
+                      "settings put secure enabled_notification_listeners",
+                      "enabled_notification_listeners", "RevivalListener", "revivalComp"))
+                     and "通知使用权 " in gs and "秒级拉起" in gs),
+        # v3.7 三管线自动授权：WRITE_SECURE_SETTINGS（自愈命门）+ 无障碍服务（第二重绑定）
+        ("三管线自动授权", all(k in gs for k in
+                     ("android.permission.WRITE_SECURE_SETTINGS",
+                      "grantAccessibility", "settings put secure enabled_accessibility_services",
+                      "settings put secure accessibility_enabled 1", "KeepAliveAccessibility",
+                      "wssOk", "accOk", "三管线自愈命门"))
+                     and "安全设置写入 " in gs and "无障碍 " in gs),
     ]
     bad = [n for n, ok in checks if not ok]
     for n, ok in checks:
@@ -330,7 +407,7 @@ def main():
     ap = argparse.ArgumentParser(description="构建学时兑守护手机 App")
     ap.add_argument("--embed-adbkey", action="store_true",
                     help="内置本机 ~/.android/adbkey，盒子免授权弹窗（私钥会进 APK）")
-    ap.add_argument("--adb-test", nargs="?", const="192.168.1.100:5555",
+    ap.add_argument("--adb-test", nargs="?", const="192.168.31.9:5555",
                     default=None, metavar="HOST:PORT",
                     help="构建前先用纯 Java 核心连盒子自检")
     ap.add_argument("--regen-icons", action="store_true",
@@ -341,7 +418,7 @@ def main():
         adb_selftest(a.adb_test)
     tv_selftest()
     check_compat()
-    print("[OK] 不内置 TV 安装包：安装时由 App 从「下载网址」联网获取")
+    print("[OK] 不内置目标 App 安装包：每个任务可选「固定下载网址」或「手机本地 APK」推送安装")
     ensure_icons(a.regen_icons)
 
     stamp = time.strftime("%Y%m%d_%H%M%S")

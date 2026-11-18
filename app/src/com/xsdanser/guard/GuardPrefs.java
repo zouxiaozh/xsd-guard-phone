@@ -8,9 +8,9 @@ import java.util.List;
 /** 设备列表用「名称|IP:端口|开关」每行一台，避免依赖 org.json / Gson。 */
 final class GuardPrefs {
     private static final String FILE = "xsd_guard_prefs";
-    static final String DEFAULT_DEVICES = "电视|192.168.1.100:5555|1";
+    static final String DEFAULT_DEVICES = "小米电视|192.168.31.9:5555|1";
     /** v2.0 的旧默认值：覆盖安装且从未改过设备列表时，自动迁移成新默认名。 */
-    private static final String LEGACY_DEVICES = "客厅电视|192.168.1.100:5555|1";
+    private static final String LEGACY_DEVICES = "客厅-小米盒子4|192.168.31.9:5555|1";
 
     private final SharedPreferences sp;
 
@@ -51,6 +51,47 @@ final class GuardPrefs {
         sp.edit().putString("apkurl", v).commit();
     }
 
+    // ------------------------------------------------------------- v3 通用任务配置
+    /** 任务串存放键；升级时若没有这个键，就把老的单一下载网址迁移成默认任务。 */
+    private static final String TASKS_KEY = "tasks_v3";
+
+    String tasksRaw() {
+        return sp.contains(TASKS_KEY) ? sp.getString(TASKS_KEY, "") : "";
+    }
+
+    void setTasksRaw(String s) {
+        sp.edit().putString(TASKS_KEY, s == null ? "" : s).commit();
+    }
+
+    void setTasks(List<GuardTask> list) {
+        StringBuilder b = new StringBuilder();
+        if (list != null) {
+            for (int i = 0; i < list.size(); i++) {
+                if (i > 0) b.append(';');
+                b.append(list.get(i).serialize());
+            }
+        }
+        setTasksRaw(b.toString());
+    }
+
+    /** 读取任务列表；老版本升级后第一条任务仍是「学时兑」，行为不变。 */
+    List<GuardTask> tasks() {
+        List<GuardTask> out = new ArrayList<GuardTask>();
+        if (!sp.contains(TASKS_KEY)) {
+            GuardTask d = GuardTask.defaultTask(apkUrl());
+            out.add(d);
+            setTasks(out);
+            return out;
+        }
+        String raw = tasksRaw().replace('\r', ';').replace('\n', ';').replace('；', ';');
+        String[] lines = raw.split(";");
+        for (int i = 0; i < lines.length; i++) {
+            GuardTask t = GuardTask.parse(lines[i].trim());
+            if (t != null) out.add(t);
+        }
+        return out;
+    }
+
     /**
      * 单行输入框下多设备用分号隔开；历史上按换行分隔的配置同样能读，
      * 这样把输入框收成一行也不会丢掉已有的多台设备。
@@ -72,8 +113,8 @@ final class GuardPrefs {
         }
         if (out.isEmpty()) {
             Dev d = new Dev();
-            d.name = "电视";
-            d.addr = "192.168.1.100:5555";
+            d.name = "小米电视";
+            d.addr = "192.168.31.9:5555";
             d.on = true;
             out.add(d);
         }

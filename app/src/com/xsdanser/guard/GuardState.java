@@ -26,7 +26,37 @@ final class GuardState {
     /** v2.14：守护期间检测到学时兑被删掉、自动补装的累计次数。 */
     static volatile int reinstalls;
     static volatile String via = "-";
+    /** v3.0：每个任务的安装状态：0 未检测 / 1 已安装 / 2 未安装。 */
+    private static final java.util.HashMap<String, Integer> TASK_INSTALLED =
+            new java.util.HashMap<String, Integer>();
+    /** v3.1：最近一次「查询电视第三方包名」的结果。null 表示还没查过。 */
+    static volatile java.util.List<String> thirdPartyPkgs;
+    /** v3.1：查询包名时的状态提示（成功条数 / 错误信息）。 */
+    static volatile String pkgQueryHint = "";
     static volatile Runnable onChange;
+
+    /** 记录单个任务的安装状态；同时保留 tvInstalled 供老接口兼容。 */
+    static synchronized void setTaskInstalled(String id, int state) {
+        if (id == null) return;
+        TASK_INSTALLED.put(id, Integer.valueOf(state));
+        if ("xsd".equals(id)) tvInstalled = state;
+    }
+
+    static synchronized int taskInstalled(String id) {
+        if (id == null) return 0;
+        Integer v = TASK_INSTALLED.get(id);
+        return v == null ? 0 : v.intValue();
+    }
+
+    /** 任务被删除时清理状态，避免界面残留旧提示。 */
+    static synchronized void clearTaskStates(java.util.List<GuardTask> keep) {
+        TASK_INSTALLED.clear();
+        if (keep != null) {
+            for (int i = 0; i < keep.size(); i++) {
+                TASK_INSTALLED.put(keep.get(i).id, Integer.valueOf(0));
+            }
+        }
+    }
 
     static void set(String s, String d) {
         status = s;

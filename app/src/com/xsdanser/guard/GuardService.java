@@ -6,6 +6,7 @@ import android.app.PendingIntent;
 import android.app.Service;
 import android.content.Context;
 import android.content.Intent;
+import android.net.Uri;
 import android.net.wifi.WifiManager;
 import android.os.Build;
 import android.os.IBinder;
@@ -18,6 +19,7 @@ import java.io.IOException;
 import java.io.InputStream;
 import java.net.HttpURLConnection;
 import java.net.URL;
+import java.util.ArrayList;
 import java.util.List;
 
 /**
@@ -48,6 +50,8 @@ import java.util.List;
  *         自动下载安装包 → 推送安装 → 补齐权限 → 唤醒，装回后守护继续。
  * v2.14.2：补装失败的冷却改为 60/120/240/480 秒（此前首轮即 120 秒），冷却期间每轮
  *          打印「还剩多少秒」，且不再每轮重复刷「转自动补装」；前因并入补装首行日志。
+ * v3.0：通用守护 —— 不再写死学时兑。每个守护任务自带包名、显示名、安装 / 授权 / 拉起开关，
+ *       安装包来源二选一：固定下载网址，或在 App 里从手机本地选择 APK 后经 ADB 推送安装。
  */
 public class GuardService extends Service {
     public static final String ACTION_START = "com.xsdanser.guard.START";
@@ -57,14 +61,15 @@ public class GuardService extends Service {
     public static final String ACTION_GRANT = "com.xsdanser.guard.GRANT";
     public static final String ACTION_CONNECT = "com.xsdanser.guard.CONNECT";
     public static final String ACTION_DISCONNECT = "com.xsdanser.guard.DISCONNECT";
+    /** v3.1：查询电视里所有第三方应用包名（供复制后填入任务）。 */
+    public static final String ACTION_LIST_PKGS = "com.xsdanser.guard.LIST_PKGS";
 
     private static final String CHANNEL = "xsd_guard";
     private static final int NOTI_ID = 1;
-    private static final String PKG = "com.xsdanser.tv";
-    /** TV 安装包文件名（与下载网址同名）：用作本地缓存名与设备临时路径。 */
+    /** 默认任务仍是学时兑：老用户升级后无需重新配置。 */
+    private static final String DEFAULT_PKG = "com.xsdanser.tv";
     private static final String APK_ASSET = "XsdAnser-v30-ui.apk";
-    private static final String APK_URL = "https://xsd.qx47.com/download/XsdAnser-v30-ui.apk";
-    private static final String REMOTE_APK = "/data/local/tmp/" + APK_ASSET;
+    private static final String APK_URL = GuardPrefs.DEFAULT_APK_URL;
     /** ADB 未连通时的连通性检测节律（秒）；连通后回到用户配置的检测间隔。 */
     private static final int ADB_RETRY_SEC = 10;
     /** 「始终允许」等待轮数：每轮最长约 90 秒（电视授权弹窗等待），走完仍无结果才判失败。 */
@@ -82,6 +87,36 @@ public class GuardService extends Service {
         long nextAt;        // 下次允许重试的时间点（毫秒）
     }
     private final java.util.HashMap<String, Heal> heals = new java.util.HashMap<String, Heal>();
+
+    /** v3：当前生效的任务列表（来自配置，UI 改动后下一轮立即读取）。 */
+    private List<GuardTask> tasks() {
+        return new GuardPrefs(this).tasks();
+    }
+
+    private GuardTask taskById(String id) {
+        if (id == null) return null;
+        List<GuardTask> all = tasks();
+        for (int i = 0; i < all.size(); i++) {
+            if (id.equals(all.get(i).id)) return all.get(i);
+        }
+        return null;
+    }
+
+    /** 指定任务时只处理它；未指定则处理全部已启用任务。 */
+    private List<GuardTask> selectedTasks(String id) {
+        List<GuardTask> out = new ArrayList<GuardTask>();
+        List<GuardTask> all = tasks();
+        for (int i = 0; i < all.size(); i++) {
+            GuardTask t = all.get(i);
+            if (!t.enabled) continue;
+            if (id == null || id.length() == 0 || id.equals(t.id)) out.add(t);
+        }
+        return out;
+    }
+
+    private static String labelOf(GuardTask t) {
+        return t == null ? "目标 App" : t.label;
+    }
 
     private volatile boolean alive;
     private volatile boolean maintenance;
@@ -103,6 +138,7 @@ public class GuardService extends Service {
 
     @Override public int onStartCommand(Intent i, int flags, int startId) {
         String a = (i == null || i.getAction() == null) ? ACTION_START : i.getAction();
+        final String taskId = (i == null) ? null : i.getStringExtra("taskId");
         // v2.9：原「保活设置」按钮已取消 —— 安装 / 启动守护时自动检测并申请本机电池白名单
         if (ACTION_INSTALL.equals(a) || ACTION_START.equals(a)) {
             ensurePhoneKeepAlive(ACTION_INSTALL.equals(a) ? "[安装] " : "[启动守护] ");
@@ -120,7 +156,11 @@ public class GuardService extends Service {
             return START_STICKY;
         }
         if (ACTION_INSTALL.equals(a) || ACTION_GRANT.equals(a)) {
-            runMaintenance(a);
+            runMaintenance(a, taskId);
+            return START_STICKY;
+        }
+        if (ACTION_LIST_PKGS.equals(a)) {
+            runListPackages();
             return START_STICKY;
         }
         if (ACTION_CHECK.equals(a)) {
@@ -162,9 +202,9 @@ public class GuardService extends Service {
                     GuardState.set("单次检测完成", "");
                     return;
                 }
-                // v2.7：启动守护先逐台检测并补齐学时兑必需权限，缺的自动开通
+                // v3：启动守护先按任务逐个检测并补齐目标 App 必需权限，缺的自动开通
                 try {
-                    GuardLog.i(GuardService.this, "启动守护：先检测学时兑必需权限（悬浮窗 / 电池白名单 / 自启 / 防休眠）");
+                    GuardLog.i(GuardService.this, "启动守护：先检测各任务的权限（悬浮窗 / 电池白名单 / 自启 / 防休眠）");
                     ensureAllPermissions();
                 } catch (Throwable t) {
                     GuardLog.i(GuardService.this, "权限自检异常（不阻塞守护）：" + t);
@@ -212,6 +252,13 @@ public class GuardService extends Service {
         if (disconnected) return;               // v2.11：手动断开后不再自动判活 / 重连
         GuardPrefs p = new GuardPrefs(this);
         List<GuardPrefs.Dev> devs = p.devices();
+        List<GuardTask> ts = selectedTasks(null);
+        if (ts.isEmpty()) {
+            GuardState.adbOk = false;
+            GuardState.set("没有启用任务", "请到「守护任务」里添加并启用至少一个目标 App");
+            updateNoti("没有启用任务");
+            return;
+        }
         AdbCrypto crypto;
         try { crypto = loadCrypto(); }
         catch (Exception e) {
@@ -226,7 +273,7 @@ public class GuardService extends Service {
             GuardPrefs.Dev d = devs.get(i);
             if (!d.on) continue;
             on++;
-            if (checkOne(d, crypto)) ok++;
+            if (checkOne(d, crypto, ts)) ok++;
         }
         if (on == 0) {
             GuardState.adbOk = false;
@@ -263,14 +310,14 @@ public class GuardService extends Service {
         }
     }
 
-    /** 检测一台设备；返回 ADB 是否连通（连通即守护已生效，与学时兑服务状态无关）。 */
-    private boolean checkOne(GuardPrefs.Dev d, AdbCrypto crypto) {
+    /** 检测一台设备上的全部启用任务；返回 ADB 是否连通（与任务服务状态无关）。 */
+    private boolean checkOne(GuardPrefs.Dev d, AdbCrypto crypto, List<GuardTask> tasks) {
         String tag = "[" + d.name + "] ";
         String[] addrs = TvCompat.addresses(d.addr);
         if (addrs.length == 0) {
             GuardState.checks++;
             GuardState.fails++;
-            GuardLog.i(this, tag + "设备地址无效，请填 IP:端口（例 192.168.1.100:5555）");
+            GuardLog.i(this, tag + "设备地址无效，请填 IP:端口（例 192.168.31.9:5555）");
             GuardState.set("地址无效", "设备列表里填的地址无法识别：" + d.addr);
             updateNoti("地址无效 · " + d.name);
             return false;
@@ -290,85 +337,96 @@ public class GuardService extends Service {
                 if (addrs.length > 1)
                     GuardLog.i(this, tag + "已连接 " + addr + "（第 " + (a + 1) + " 个候选地址）");
 
-                String pm = null;
-                try { pm = c.shell("pm path " + PKG); } catch (Exception ignored) {}
-                int inst = TvCompat.installState(c, PKG, pm);
-                if (inst > 0) {
-                    // v2.13：守护轮询里读到已安装，同步刷新界面的「可跳过」提示
-                    if (GuardState.tvInstalled != 1) {
-                        GuardState.tvInstalled = 1;
-                        GuardState.fire();
+                // 一条 ADB 连接里顺序处理所有任务，避免多任务互相抢盒子唯一连接
+                for (int ti = 0; ti < tasks.size(); ti++) {
+                    GuardTask t = tasks.get(ti);
+                    if (!t.enabled) continue;
+                    String ttag = tag + "[" + t.label + "] ";
+                    String pm = null;
+                    try { pm = c.shell("pm path " + t.pkg); } catch (Exception ignored) {}
+                    int inst = TvCompat.installState(c, t.pkg, pm);
+                    GuardState.setTaskInstalled(t.id, inst > 0 ? 1 : inst < 0 ? 2 : 0);
+                    GuardState.fire();
+
+                    if (inst < 0) {
+                        // 目标 App 被卸载 / 被清理：按任务自己的开关决定是否补装
+                        if (!t.autoInstall()) {
+                            GuardLog.i(this, ttag + "目标 App 未安装（此任务未开启自动补装），本轮跳过");
+                            GuardState.set("目标 App 未安装", t.label + " · " + d.name);
+                        } else {
+                            try { c.close(); } catch (Exception ignored) {}
+                            c = null;
+                            healReinstall(d, crypto, ttag, t);
+                        }
+                        // 补装 / 跳过都不算 ADB 断线：本台连接是通的
+                        return true;
                     }
-                } else if (inst < 0) {
-                    // v2.14：学时兑被卸载 / 被电视管家清理 —— 自动补装并唤醒
-                    // v2.14.2：前因统一由 healReinstall 的首行日志说明（那条只在真正开始补装时写），
-                    //          这里不再重复，避免等待冷却期间每轮刷一条「转自动补装」。
-                    GuardState.tvInstalled = 2;
+                    if (inst == 0) {
+                        // 有的定制 ROM 输出格式特殊，判不出来时不补装，也不阻断其它任务
+                        GuardLog.i(this, ttag + "未在电视上读到安装包信息，仍继续检测");
+                        continue;
+                    }
+                    if (t.autoGrant()) ensureTvPermissions(c, ttag, t);
+
+                    TvCompat.Probe pr = TvCompat.probe(c, t.pkg);
+                    GuardState.setVia(pr.via);
+                    if (pr.state == null) {
+                        GuardLog.i(this, ttag + "服务状态无法判定，本轮跳过（ROM 输出格式特殊）");
+                        GuardState.set("判活不可判定", t.label + " · 电视输出无法识别，下轮重试");
+                        updateNoti("判活不可判定 · " + d.name);
+                        continue;
+                    }
+                    if (pr.state.booleanValue()) {
+                        // v2.14.3：界面/通知统一叫「守护运行中」
+                        GuardLog.i(this, ttag + "守护运行中");
+                        GuardState.set("守护运行中", t.label + " · " + d.name + " · " + addr);
+                        updateNoti("守护运行中 · " + d.name);
+                        continue;
+                    }
+                    if (!t.autoLaunch()) {
+                        GuardLog.i(this, ttag + "服务未运行（此任务未开启自动拉起），本轮跳过");
+                        GuardState.set("服务未运行", t.label + " · 未开启自动拉起");
+                        continue;
+                    }
+
+                    GuardLog.i(this, ttag + "服务消失，执行静默拉起");
+                    GuardState.set("正在拉起", t.label + " · " + d.name);
+                    updateNoti("正在拉起 · " + d.name);
+                    ensureTvPermissions(c, ttag, t);
+                    String[] cmds = TvCompat.launchCommands(t.pkg);
+                    for (int k = 0; k < cmds.length; k++) {
+                        String out = null;
+                        try { out = c.shell(cmds[k]); }
+                        catch (Exception e) { GuardLog.i(this, ttag + "拉起命令异常，改试下一种"); }
+                        try {
+                            android.util.Log.i("XsdGuard", ttag + "拉起 " + (k + 1)
+                                    + " 原始返回：" + oneLine(out));
+                        } catch (Throwable ignored) {}
+                        boolean failed = TvCompat.launchFailed(out);
+                        GuardLog.i(this, ttag + "拉起 " + (k + 1) + "/" + cmds.length
+                                + "：" + (failed ? "返回错误，改试下一种" : "已执行"));
+                        if (!failed) break;
+                    }
+                    GuardState.relaunches++;
+                    try { Thread.sleep(3000); } catch (InterruptedException e) { return true; }
+
+                    // 盒子同一时间只允许一个 ADB 客户端：复核前必须先释放当前连接
                     try { c.close(); } catch (Exception ignored) {}
                     c = null;
-                    healReinstall(d, crypto, tag);
-                    // 补装成功与否都不算「ADB 断线」：本台连接是通的
-                    return true;
-                } else {
-                    // 有的定制 ROM 输出格式特殊，判不出来时不补装，也不阻断检测
-                    GuardLog.i(this, tag + "未在电视上读到学时兑安装信息，仍继续检测");
-                }
-
-                TvCompat.Probe pr = TvCompat.probe(c, PKG);
-                GuardState.setVia(pr.via);
-                if (pr.state == null) {
-                    GuardLog.i(this, tag + "服务状态无法判定，本轮跳过（ROM 输出格式特殊）");
-                    GuardState.set("判活不可判定", "电视的 dumpsys / ps 输出无法识别，下轮重试");
-                    updateNoti("判活不可判定 · " + d.name);
-                    return true;
-                }
-                if (pr.state.booleanValue()) {
-                    // v2.14.3：界面/通知统一叫「守护运行中」（原「服务运行中」）
-                    GuardLog.i(this, tag + "守护运行中");
-                    GuardState.set("守护运行中", d.name + " · " + addr);
-                    updateNoti("守护运行中 · " + d.name);
-                    return true;
-                }
-
-                GuardLog.i(this, tag + "服务消失，执行静默拉起");
-                GuardState.set("正在拉起", d.name);
-                updateNoti("正在拉起 · " + d.name);
-                ensureTvPermissions(c, tag);
-                String[] cmds = TvCompat.launchCommands(PKG);
-                for (int k = 0; k < cmds.length; k++) {
-                    String out = null;
-                    try { out = c.shell(cmds[k]); }
-                    catch (Exception e) { GuardLog.i(this, tag + "拉起命令异常，改试下一种"); }
-                    // 界面日志只写中文结论，命令原始返回仅进 logcat
+                    AdbClient c2 = null;
                     try {
-                        android.util.Log.i("XsdGuard", tag + "拉起 " + (k + 1)
-                                + " 原始返回：" + oneLine(out));
-                    } catch (Throwable ignored) {}
-                    boolean failed = TvCompat.launchFailed(out);
-                    GuardLog.i(this, tag + "拉起 " + (k + 1) + "/" + cmds.length
-                            + "：" + (failed ? "返回错误，改试下一种" : "已执行"));
-                    if (!failed) break;
-                }
-                GuardState.relaunches++;
-                try { Thread.sleep(3000); } catch (InterruptedException e) { return true; }
-
-                // 盒子同一时间只允许一个 ADB 客户端：复核前必须先释放当前连接，否则复核必失败
-                if (c != null) {
-                    try { c.close(); } catch (Exception ignored) {}
-                    c = null;
-                }
-                AdbClient c2 = null;
-                try {
-                    c2 = new AdbClient(TvCompat.host(addr), TvCompat.port(addr), crypto);
-                    c2.connect(5000, 20000, 12000);
-                    TvCompat.Probe after = TvCompat.probe(c2, PKG);
-                    boolean ok = Boolean.TRUE.equals(after.state);
-                    GuardLog.i(this, tag + "复核：" + (ok ? "服务已恢复" : "服务仍未起，下轮继续"));
-                    GuardState.set(ok ? "服务已恢复" : "等待下轮重试", d.name);
-                } catch (Exception e) {
-                    GuardLog.i(this, tag + "复核失败：" + TvCompat.explain(e, addr).hint);
-                } finally {
-                    if (c2 != null) c2.close();
+                        c2 = new AdbClient(TvCompat.host(addr), TvCompat.port(addr), crypto);
+                        c2.connect(5000, 20000, 12000);
+                        TvCompat.Probe after = TvCompat.probe(c2, t.pkg);
+                        boolean ok = Boolean.TRUE.equals(after.state);
+                        GuardLog.i(this, ttag + "复核：" + (ok ? "服务已恢复" : "服务仍未起，下轮继续"));
+                        GuardState.set(ok ? "服务已恢复" : "等待下轮重试", t.label + " · " + d.name);
+                    } catch (Exception e) {
+                        GuardLog.i(this, ttag + "复核失败：" + TvCompat.explain(e, addr).hint);
+                    } finally {
+                        if (c2 != null) c2.close();
+                    }
+                    return true;
                 }
                 return true;
             } catch (Throwable e) {
@@ -381,7 +439,6 @@ public class GuardService extends Service {
 
         TvCompat.Err x = TvCompat.explain(last, d.addr);
         GuardState.fails++;
-        // 界面 / 文件日志只留中文；Java 异常原文仅进 logcat，方便排查又不碍眼
         try { android.util.Log.i("XsdGuard", tag + "技术详情 " + TvCompat.tech(last)); }
         catch (Throwable ignored) {}
         GuardLog.i(this, tag + TvCompat.logLine(last, d.addr));
@@ -392,75 +449,123 @@ public class GuardService extends Service {
 
     // ------------------------------------------------------------- 自动补装（v2.14）
     /**
-     * 守护运行期间发现电视上的学时兑被删掉时：自动下载安装包、推送安装、补齐权限并唤醒。
-     * 先用手里的缓存包（快，断网也能装回）；缓存装不上就当缓存损坏删掉，改按下载网址重下。
+     * 守护运行期间发现任务目标 App 被删掉时：按该任务的安装包来源取出 APK、
+     * 推送安装、补齐权限并唤醒。先用缓存包（快、断网也能装回），失败再按来源重新取包。
      * 失败按 60/120/240/480 秒冷却重试，避免网络不通时每轮都去抢电视那一个 ADB 连接。
      */
-    private boolean healReinstall(GuardPrefs.Dev d, AdbCrypto crypto, String tag) {
-        Heal h = heals.get(d.addr);
+    private boolean healReinstall(GuardPrefs.Dev d, AdbCrypto crypto, String tag, GuardTask t) {
+        String key = t.id + "|" + d.addr;
+        Heal h = heals.get(key);
         if (h == null) {
             h = new Heal();
-            heals.put(d.addr, h);
+            heals.put(key, h);
         }
         long now = System.currentTimeMillis();
-        // v2.14.1：连续失败 1/2/3/4 次 → 60/120/240/480 秒，与界面提示和文档口径一致
         long wait = HEAL_COOLDOWN_MS * (1L << Math.min(Math.max(h.fails - 1, 0), 3));
         if (h.last > 0 && now - h.last < wait) {
-            // v2.14.1：冷却期间每轮都写一条「还剩多少秒」，让人看得出在等而不是卡住
             long left = (wait - (now - h.last) + 999) / 1000;
             GuardLog.i(this, tag + "自动补装冷却中：还剩 " + left + " 秒重试（已连续失败 "
                     + h.fails + " 次）");
-            GuardState.set("等待自动补装", d.name + " · 学时兑不在电视上，约 " + left + " 秒后重试");
+            GuardState.set("等待自动补装", t.label + " · " + d.name + " · 约 " + left + " 秒后重试");
             updateNoti("等待自动补装 · " + d.name);
             return false;
         }
         h.last = now;
         h.reported = false;
-        GuardState.set("正在自动补装", d.name + " · 学时兑被删除，自动下载安装");
-        updateNoti("正在自动补装学时兑 · " + d.name);
-        GuardLog.i(this, tag + "检测到学时兑已不在电视上（被卸载或被清理），开始自动补装："
-                + "准备安装包 → 推送 → 安装 → 补齐权限 → 唤醒");
+        GuardState.set("正在自动补装", t.label + " · " + d.name + " · 目标 App 已不在电视上");
+        updateNoti("正在自动补装 " + t.label + " · " + d.name);
+        GuardLog.i(this, tag + "检测到目标 App 已不在电视上（被卸载或被清理），开始自动补装："
+                + "准备安装包（" + t.sourceName() + "）→ 推送 → 安装 → 补齐权限 → 唤醒");
         GuardState.fire();
 
-        File cache = new File(getCacheDir(), APK_ASSET);
+        File cache = new File(getCacheDir(), t.cacheName());
         boolean ok = false;
         if (cache.isFile() && cache.length() > 100000) {
             GuardLog.i(this, tag + "先用手机里缓存的安装包（" + cache.length() + " 字节）");
-            ok = installOne(d, crypto, true);
+            ok = installOne(d, crypto, t, cache, true);
             if (!ok) {
-                GuardLog.i(this, tag + "缓存包没装成功，删掉缓存，改从下载网址重新获取");
+                GuardLog.i(this, tag + "缓存包没装成功，删掉缓存，改从"
+                        + t.sourceName() + "重新获取");
                 try { cache.delete(); } catch (Throwable ignored) {}
             }
         }
         if (!ok) {
-            String url = new GuardPrefs(this).apkUrl();
             try {
-                GuardLog.i(this, tag + "手机联网下载安装包（约 2.6 MB）：" + url);
-                GuardState.set("正在下载安装包", d.name);
-                downloadApk(cache, url);
-                ok = installOne(d, crypto, true);
+                GuardLog.i(this, tag + "按" + t.sourceName() + "取安装包：" + t.sourceValue());
+                GuardState.set("正在准备安装包", t.label + " · " + t.sourceName());
+                File prepared = prepareApk(t);
+                ok = installOne(d, crypto, t, prepared, false);
             } catch (Throwable e) {
-                GuardLog.i(this, tag + "自动补装下载失败：" + TvCompat.logLine(e, url)
-                        + "（请确认手机已联网、下载网址可用）");
+                GuardLog.i(this, tag + "自动补装取包失败：" + TvCompat.logLine(e, t.sourceValue())
+                        + "（网址请确认手机联网；本地 APK 请重新在 App 里选择一次）");
             }
         }
 
         if (ok) {
             h.fails = 0;
             GuardState.reinstalls++;
-            GuardState.tvInstalled = 1;
-            GuardState.set("已自动补装并唤醒", d.name + " · 学时兑被删除后已自动装回");
-            updateNoti("已自动补装学时兑 · " + d.name);
+            GuardState.setTaskInstalled(t.id, 1);
+            GuardState.set("已自动补装并唤醒", t.label + " · " + d.name + " · 已自动装回");
+            updateNoti("已自动补装 " + t.label + " · " + d.name);
             GuardLog.i(this, tag + "自动补装完成：已重装、已补齐权限并唤醒，守护继续");
             GuardState.fire();
             return true;
         }
         h.fails++;
+        GuardState.setTaskInstalled(t.id, 2);
         long next = HEAL_COOLDOWN_MS * (1L << Math.min(Math.max(h.fails - 1, 0), 3)) / 1000;
-        GuardState.set("自动补装失败", d.name + " · 约 " + next + " 秒后自动重试");
+        GuardState.set("自动补装失败", t.label + " · 约 " + next + " 秒后自动重试");
         updateNoti("自动补装失败 · " + d.name);
         GuardLog.i(this, tag + "自动补装未成功，约 " + next + " 秒后自动重试（第 " + h.fails + " 次失败）");
         return false;
+    }
+
+    /**
+     * v3：把任务指定的安装包准备好，落到本机缓存文件。
+     * 固定网址 → 联网下载；本地 APK → 从 content:// / file:// URI 读取并复制。
+     * 两种来源都支持无网重装（缓存存在时直接用缓存）。
+     */
+    private File prepareApk(GuardTask t) throws Exception {
+        File cache = new File(getCacheDir(), t.cacheName());
+        File tmp = new File(getCacheDir(), t.cacheName() + ".tmp");
+        InputStream in = null;
+        FileOutputStream out = null;
+        try {
+            if (t.source == GuardTask.SRC_LOCAL) {
+                if (t.localUri == null || t.localUri.trim().length() == 0)
+                    throw new IOException("未选择手机本地 APK，请在 App 里点「选择本地 APK」");
+                Uri uri = Uri.parse(t.localUri.trim());
+                in = getContentResolver().openInputStream(uri);
+                if (in == null) throw new IOException("本地 APK 读取失败，可能授权已失效，请重新选择一次");
+                GuardLog.i(this, "从手机本地读取安装包：" + oneLine(t.localUri));
+            } else {
+                String url = (t.apkUrl == null || t.apkUrl.trim().length() == 0)
+                        ? APK_URL : t.apkUrl.trim();
+                GuardLog.i(this, "手机联网从固定网址获取安装包：" + url);
+                GuardState.set("正在下载安装包", t.label);
+                HttpURLConnection conn = (HttpURLConnection) new URL(url).openConnection();
+                conn.setConnectTimeout(15000);
+                conn.setReadTimeout(120000);
+                conn.setInstanceFollowRedirects(true);
+                in = conn.getInputStream();
+            }
+            out = new FileOutputStream(tmp);
+            byte[] b = new byte[8192];
+            int n;
+            while ((n = in.read(b)) > 0) out.write(b, 0, n);
+            out.close(); out = null;
+            in.close(); in = null;
+            if (tmp.length() < 100000) throw new IOException("安装包只有 " + tmp.length()
+                    + " 字节，明显不完整，已放弃");
+            if (cache.exists() && !cache.delete()) throw new IOException("旧缓存无法覆盖");
+            if (!tmp.renameTo(cache)) throw new IOException("缓存文件写入失败");
+            GuardLog.i(this, "安装包已就绪：" + t.label + "（" + cache.length() + " 字节）");
+            return cache;
+        } finally {
+            if (in != null) try { in.close(); } catch (Throwable ignored) {}
+            if (out != null) try { out.close(); } catch (Throwable ignored) {}
+            try { tmp.delete(); } catch (Throwable ignored) {}
+        }
     }
 
     // ------------------------------------------------------------- 连接 ADB（手动）
@@ -503,7 +608,7 @@ public class GuardService extends Service {
                             maintenance = true;
                             probeTvInstalled();
                         } catch (Throwable t) {
-                            GuardLog.i(GuardService.this, "学时兑安装状态检测跳过：" + t);
+                            GuardLog.i(GuardService.this, "目标 App 安装状态检测跳过：" + t);
                         } finally {
                             maintenance = false;
                         }
@@ -511,7 +616,7 @@ public class GuardService extends Service {
                         GuardLog.i(GuardService.this, "ADB 连接成功（含「始终允许」确认），安装 / 授权 / 守护已解锁，"
                                 + "每 " + ADB_RETRY_SEC + " 秒自动检查是否仍在连接");
                         if (wasRunning) { alive = true; startWorker(false); }
-                        else GuardState.set("ADB 已连接", "可安装学时兑 / 开通权限 / 启动守护");
+                        else GuardState.set("ADB 已连接", "可安装任务 App / 开通权限 / 启动守护");
                     } else {
                         GuardState.adbOk = false;
                         GuardState.set("ADB 未连接", "连接失败：请检查设备地址与 ADB 开关；"
@@ -555,7 +660,7 @@ public class GuardService extends Service {
         String tag = "[" + d.name + "] ";
         String[] addrs = TvCompat.addresses(d.addr);
         if (addrs.length == 0) {
-            GuardLog.i(this, tag + "设备地址无效，请填 IP:端口（例 192.168.1.100:5555）");
+            GuardLog.i(this, tag + "设备地址无效，请填 IP:端口（例 192.168.31.9:5555）");
             return false;
         }
         for (String addr : addrs) {
@@ -734,7 +839,7 @@ public class GuardService extends Service {
     }
 
     /**
-     * v2.13：连接成功后检测电视上是否已安装学时兑，决定「安装」这一步能否跳过。
+     * v3：连接成功后逐任务检测目标 App 是否已安装，已装的安装步骤可跳过。
      * 只有明确读到 pm path 的 package: 才判已安装；连不上 / 定制 ROM 输出特殊时
      * 保持「未检测」，既不误报也不影响用户照常点安装。
      */
@@ -742,34 +847,37 @@ public class GuardService extends Service {
         AdbCrypto crypto = loadCryptoSafe();
         if (crypto == null) return;
         List<GuardPrefs.Dev> devs = new GuardPrefs(this).devices();
-        boolean installed = false;
-        boolean reachable = false;
-        for (GuardPrefs.Dev d : devs) {
-            if (!d.on) continue;
-            for (String addr : TvCompat.addresses(d.addr)) {
-                AdbClient c = null;
-                try {
-                    c = new AdbClient(TvCompat.host(addr), TvCompat.port(addr), crypto);
-                    c.connect(5000, 10000, 10000);
-                    reachable = true;
-                    String pm = sh(c, "pm path " + PKG);
-                    if (TvCompat.packageInstalled(pm)) { installed = true; break; }
-                } catch (Throwable ignored) {
-                } finally {
-                    if (c != null) c.close();
+        List<GuardTask> ts = tasks();
+        for (int ti = 0; ti < ts.size(); ti++) {
+            GuardTask t = ts.get(ti);
+            if (!t.enabled) continue;
+            boolean installed = false;
+            boolean reachable = false;
+            for (GuardPrefs.Dev d : devs) {
+                if (!d.on) continue;
+                for (String addr : TvCompat.addresses(d.addr)) {
+                    AdbClient c = null;
+                    try {
+                        c = new AdbClient(TvCompat.host(addr), TvCompat.port(addr), crypto);
+                        c.connect(5000, 10000, 10000);
+                        reachable = true;
+                        String pm = sh(c, "pm path " + t.pkg);
+                        if (TvCompat.packageInstalled(pm)) { installed = true; break; }
+                    } catch (Throwable ignored) {
+                    } finally {
+                        if (c != null) c.close();
+                    }
                 }
+                if (installed) break;
             }
-            if (installed) break;
-        }
-        if (installed) {
-            GuardState.tvInstalled = 1;
-            GuardLog.i(this, "电视已安装学时兑：可跳过安装，直接点「启动守护」");
-        } else if (reachable) {
-            GuardState.tvInstalled = 2;
-            GuardLog.i(this, "电视未安装学时兑：请先点「安装学时兑到电视」");
-        } else {
-            GuardState.tvInstalled = 0;
-            GuardLog.i(this, "未确认学时兑安装状态，可先安装，已装也可直接启动守护");
+            GuardState.setTaskInstalled(t.id, installed ? 1 : reachable ? 2 : 0);
+            if (installed) {
+                GuardLog.i(this, "电视已安装 " + t.label + "：可跳过安装，直接点「启动守护」");
+            } else if (reachable) {
+                GuardLog.i(this, "电视未安装 " + t.label + "：可点「安装任务到电视」");
+            } else {
+                GuardLog.i(this, "未确认 " + t.label + " 的安装状态，可先安装，已装也可直接启动守护");
+            }
         }
         GuardState.fire();
     }
@@ -824,17 +932,22 @@ public class GuardService extends Service {
      */
     private void ensureAllPermissions() {
         List<GuardPrefs.Dev> devs = new GuardPrefs(this).devices();
+        List<GuardTask> ts = selectedTasks(null);
         AdbCrypto crypto = loadCryptoSafe();
         if (crypto == null) return;
-        for (GuardPrefs.Dev d : devs) {
-            if (!d.on) continue;
-            String tag = "[" + d.name + "] ";
-            for (String addr : TvCompat.addresses(d.addr)) {
-                AdbClient c = connectWithRetry(TvCompat.host(addr), TvCompat.port(addr), crypto);
-                if (c == null) continue;
-                try { ensureTvPermissions(c, tag); }
-                finally { c.close(); }
-                break;   // 本台已处理，换下一台
+        for (int ti = 0; ti < ts.size(); ti++) {
+            GuardTask t = ts.get(ti);
+            if (!t.autoGrant()) continue;
+            for (GuardPrefs.Dev d : devs) {
+                if (!d.on) continue;
+                String tag = "[" + d.name + "][" + t.label + "] ";
+                for (String addr : TvCompat.addresses(d.addr)) {
+                    AdbClient c = connectWithRetry(TvCompat.host(addr), TvCompat.port(addr), crypto);
+                    if (c == null) continue;
+                    try { ensureTvPermissions(c, tag, t); }
+                    finally { c.close(); }
+                    break;   // 本台已处理，换下一台
+                }
             }
         }
     }
@@ -845,63 +958,146 @@ public class GuardService extends Service {
     }
 
     /**
-     * 检测一台设备的学时兑必需权限，缺哪项就执行哪项开通命令并复核；
-     * 每台设备最后输出一行汇总，已开通 / 已补放 / 未声明 一目了然。
+     * 检测一台设备上的某个目标 App 必需权限，缺哪项就执行哪项开通命令并复核；
+     * 最后输出一行汇总，已开通 / 已补放 / 未声明 一目了然。
      */
-    private void ensureTvPermissions(AdbClient c, String tag) {
+    private void ensureTvPermissions(AdbClient c, String tag, GuardTask t) {
+        String pkg = t.pkg;
         int sdk = 0;
         try {
             sdk = Integer.parseInt(oneLine(sh(c, "getprop ro.build.version.sdk")).trim());
         } catch (Exception ignored) {}
 
-        // 1) 悬浮窗：学时兑服务要前台化，缺权限会被系统打
-        //    「not allow service ... become forceground」并立刻回收
-        String ov = sh(c, "appops get " + PKG + " SYSTEM_ALERT_WINDOW");
+        // 1) 悬浮窗：需要前台服务的 App 缺权限会被系统立刻回收
+        String ov = sh(c, "appops get " + pkg + " SYSTEM_ALERT_WINDOW");
         boolean ovOk = ov != null && ov.toLowerCase().contains("allow");
         if (!ovOk) {
-            sh(c, "appops set " + PKG + " SYSTEM_ALERT_WINDOW allow");
-            if (sdk >= 30) sh(c, "appops set " + PKG + " SYSTEM_OVERLAY_WINDOW allow");
-            ov = sh(c, "appops get " + PKG + " SYSTEM_ALERT_WINDOW");
+            sh(c, "appops set " + pkg + " SYSTEM_ALERT_WINDOW allow");
+            if (sdk >= 30) sh(c, "appops set " + pkg + " SYSTEM_OVERLAY_WINDOW allow");
+            ov = sh(c, "appops get " + pkg + " SYSTEM_ALERT_WINDOW");
             ovOk = ov != null && ov.toLowerCase().contains("allow");
             if (ovOk) GuardLog.i(this, tag + "已自动放行悬浮窗权限"
-                    + "（学时兑服务需要前台化，缺权限会被系统立刻回收）");
+                    + "（目标 App 需要前台化，缺权限会被系统立刻回收）");
         }
 
-        // 2) 电池白名单（doze 休眠时不杀学时兑）
+        // 2) 电池白名单（doze 休眠时不杀目标 App）
         String wl = sh(c, "dumpsys deviceidle whitelist");
-        boolean wlOk = wl != null && wl.contains(PKG);
+        boolean wlOk = wl != null && wl.contains(pkg);
         if (!wlOk) {
-            sh(c, "dumpsys deviceidle whitelist +" + PKG);
+            sh(c, "dumpsys deviceidle whitelist +" + pkg);
             wl = sh(c, "dumpsys deviceidle whitelist");
-            wlOk = wl != null && wl.contains(PKG);
+            wlOk = wl != null && wl.contains(pkg);
             if (wlOk) GuardLog.i(this, tag + "已加入电池白名单");
         }
 
         // 3) + 4) 自启 / 防休眠：dumpsys package 里声明过的普通权限装完即授予；
         //    没出现的用 pm grant 尽力补放（App 未声明时会报错，仅记录不阻断）
-        String dp = sh(c, "dumpsys package " + PKG);
+        String dp = sh(c, "dumpsys package " + pkg);
         boolean bootOk = dp != null && dp.contains("android.permission.RECEIVE_BOOT_COMPLETED");
         boolean bootDeclared = bootOk;
         if (!bootOk) {
-            String out = sh(c, "pm grant " + PKG + " android.permission.RECEIVE_BOOT_COMPLETED");
-            // 普通权限授予成功通常无输出：命令未报错即视为已补放
+            String out = sh(c, "pm grant " + pkg + " android.permission.RECEIVE_BOOT_COMPLETED");
             bootOk = out == null || !TvCompat.launchFailed(out);
             if (bootOk) GuardLog.i(this, tag + "已开通自启权限（开机自启）");
         }
         boolean wakeOk = dp != null && dp.contains("android.permission.WAKE_LOCK");
         boolean wakeDeclared = wakeOk;
         if (!wakeOk) {
-            String out = sh(c, "pm grant " + PKG + " android.permission.WAKE_LOCK");
+            String out = sh(c, "pm grant " + pkg + " android.permission.WAKE_LOCK");
             wakeOk = out == null || !TvCompat.launchFailed(out);
             if (wakeOk) GuardLog.i(this, tag + "已开通防休眠权限（WAKE_LOCK）");
         }
 
-        // 汇总：已声明且在包信息里的视为「已开通」；未声明的单列，避免误报
+        // 5) 通知使用权（复活监听）：让系统长期绑定目标 App 的 RevivalListener 服务，
+        //    进程被清后系统自动重绑 -> 秒级复活。Android 10+ 用 cmd notification allow_listener，
+        //    低版本写 Settings.Secure。目标 App 未声明该服务时命令无副作用，仅记录不阻断。
+        String revivalCls = pkg + ".RevivalListener";
+        String revivalComp = pkg + "/" + revivalCls;   // 授权命令需要的 包名/组件名 格式
+        boolean revivalOk = grantNotificationListener(c, pkg, revivalComp, sdk);
+        if (revivalOk) {
+            GuardLog.i(this, tag + "已代开通知使用权（复活监听 "
+                    + revivalComp + "）：被清理后系统将自动重绑、秒级拉起");
+        } else {
+            GuardLog.i(this, tag + "通知使用权未开通（目标 App 可能未内置复活监听服务，"
+                    + "或系统版本不支持 ADB 代授权）；不影响原有 10 秒守护拉起");
+        }
+
+        // 6) WRITE_SECURE_SETTINGS（三管线自愈命门）：普通签名 App 也能用 ADB 授予。
+        //    目标 App 拿到后可把被强停清掉的通知/无障碍配置写回，实现强停秒级复活（对齐 Aerial）。
+        boolean wssOk = false;
+        String wss = sh(c, "dumpsys package " + pkg + " | grep WRITE_SECURE_SETTINGS");
+        if (wss == null || !wss.contains("granted=true")) {
+            sh(c, "pm grant " + pkg + " android.permission.WRITE_SECURE_SETTINGS");
+            wss = sh(c, "dumpsys package " + pkg + " | grep WRITE_SECURE_SETTINGS");
+            wssOk = wss != null && wss.contains("granted=true");
+            if (wssOk) GuardLog.i(this, tag + "已代开 WRITE_SECURE_SETTINGS（三管线自愈命门，"
+                    + "强停后能自己写回配置、秒级复活）");
+        } else {
+            wssOk = true;
+        }
+
+        // 7) 无障碍服务（第二重系统绑定）：追加开通目标 App 的 KeepAliveAccessibility，保留他人条目。
+        String accCls = pkg + ".KeepAliveAccessibility";
+        String accComp = pkg + "/" + accCls;
+        boolean accOk = grantAccessibility(c, accComp, sdk);
+        if (accOk) {
+            GuardLog.i(this, tag + "已代开无障碍服务（" + accComp + "）：第二重系统绑定，被清后自动重连");
+        }
+
         String bootState = bootOk ? "已开通" : (dp != null && !bootDeclared ? "App 未声明" : "未开通");
         String wakeState = wakeOk ? "已开通" : (dp != null && !wakeDeclared ? "App 未声明（前台服务自带保活）" : "未开通");
         GuardLog.i(this, tag + "权限自检：悬浮窗 " + (ovOk ? "已开通" : "未开通")
                 + " · 电池白名单 " + (wlOk ? "已开通" : "未开通")
-                + " · 自启 " + bootState + " · 防休眠 " + wakeState);
+                + " · 自启 " + bootState + " · 防休眠 " + wakeState
+                + " · 通知使用权 " + (revivalOk ? "已开通" : "未开通")
+                + " · 安全设置写入 " + (wssOk ? "已开通" : "未开通")
+                + " · 无障碍 " + (accOk ? "已开通" : "未开通"));
+    }
+
+    /** 为目标 App 开通无障碍服务（追加保留他人条目），并打开总开关。 */
+    private boolean grantAccessibility(AdbClient c, String comp, int sdk) {
+        try {
+            String cur = sh(c, "settings get secure enabled_accessibility_services");
+            String val = (cur == null || cur.trim().isEmpty() || "null".equalsIgnoreCase(cur.trim()))
+                    ? comp : (cur.trim().contains(comp) ? cur.trim() : cur.trim() + ":" + comp);
+            sh(c, "settings put secure enabled_accessibility_services " + val);
+            sh(c, "settings put secure accessibility_enabled 1");
+            String check = sh(c, "settings get secure enabled_accessibility_services");
+            return check != null && (check.contains(comp) || check.contains(comp.split("/")[0]));
+        } catch (Throwable t) {
+            return false;
+        }
+    }
+
+    /**
+     * 通过 ADB 为目标 App 开通通知使用权（复活监听服务），并复核。
+     * @param pkg 目标包名
+     * @param comp 完整组件名 包名/服务类名
+     * @param sdk 设备 API 等级
+     * @return 是否已开通
+     */
+    private boolean grantNotificationListener(AdbClient c, String pkg, String comp, int sdk) {
+        try {
+            if (sdk >= 29) {
+                // Android 10+：cmd notification allow_listener
+                String out = sh(c, "cmd notification allow_listener " + comp);
+                if (out != null && out.toLowerCase().contains("unknown")) {
+                    // 极少数系统无该 cmd，回退到 secure setting
+                    sh(c, "settings put secure enabled_notification_listeners " + comp);
+                }
+            } else {
+                // Android 9-：追加到 secure setting，保留原有值（冒号分隔）
+                String cur = sh(c, "settings get secure enabled_notification_listeners");
+                String val = (cur == null || cur.trim().isEmpty() || "null".equalsIgnoreCase(cur.trim()))
+                        ? comp : (cur.trim().contains(comp) ? cur.trim() : cur.trim() + ":" + comp);
+                sh(c, "settings put secure enabled_notification_listeners " + val);
+            }
+            // 复核：不同系统回显格式不同，只要出现组件名或目标包名即认为成功
+            String check = sh(c, "settings get secure enabled_notification_listeners");
+            return check != null && (check.contains(comp) || check.contains(pkg));
+        } catch (Throwable t) {
+            return false;
+        }
     }
 
     // ------------------------------------------------------------- 维护：安装 / 授权
@@ -909,7 +1105,7 @@ public class GuardService extends Service {
      * 安装 / 授权是手动一次性操作，需要先让守护循环让出 ADB 连接：
      * 临时把守护循环停下来，等它退出当前轮，再在独立线程里执行，完成后若原本在守护则重启。
      */
-    private void runMaintenance(final String action) {
+    private void runMaintenance(final String action, final String taskId) {
         if (!GuardState.adbOk) {
             GuardLog.i(this, "ADB 未连接，已取消"
                     + (ACTION_INSTALL.equals(action) ? "安装" : "授权") + "：请先点「连接 ADB」");
@@ -927,11 +1123,13 @@ public class GuardService extends Service {
         new Thread(new Runnable() {
             public void run() {
                 try {
+                    GuardTask one = taskById(taskId);
                     GuardLog.i(GuardService.this,
-                        (ACTION_INSTALL.equals(action) ? "开始安装学时兑"
-                                                      : "开始开通学时兑权限"));
-                    if (ACTION_INSTALL.equals(action)) installAll();
-                    else grantAll();
+                        (ACTION_INSTALL.equals(action) ? "开始安装任务 App："
+                                                      : "开始开通任务 App 权限：")
+                        + (one == null ? "全部已启用任务" : one.label));
+                    if (ACTION_INSTALL.equals(action)) installAll(taskId);
+                    else grantAll(taskId);
                 } catch (Throwable t) {
                     GuardLog.i(GuardService.this, "维护任务异常：" + t);
                 } finally {
@@ -949,7 +1147,105 @@ public class GuardService extends Service {
         }, "xsd-guard-maint").start();
     }
 
-    private void installAll() {
+    /**
+     * v3.1：查询所有启用设备上安装的第三方应用包名。
+     * 与安装 / 授权一样是先让守护循环让出 ADB 连接，再在独立线程里逐台查询，
+     * 结果合并去重排序后写入 GuardState 供界面展示与复制。
+     */
+    private void runListPackages() {
+        if (!GuardState.adbOk) {
+            GuardLog.i(this, "查询包名前请先点「连接 ADB」，成功后即可查询");
+            GuardState.set("ADB 未连接", "请先点击「连接 ADB」，成功后再查询电视应用包名");
+            updateNoti("等待连接 ADB");
+            return;
+        }
+        final boolean wasRunning = (worker != null && worker.isAlive());
+        maintenance = true;
+        alive = false;
+        if (worker != null) {
+            worker.interrupt();
+            try { worker.join(20000); } catch (InterruptedException e) {}
+        }
+        new Thread(new Runnable() {
+            public void run() {
+                try {
+                    queryPackages();
+                } catch (Throwable t) {
+                    GuardLog.i(GuardService.this, "查询包名异常：" + t);
+                    GuardState.pkgQueryHint = "查询失败：" + t;
+                } finally {
+                    maintenance = false;
+                    if (wasRunning && !disconnected) { alive = true; startWorker(false); }
+                    GuardState.fire();
+                    GuardLog.i(GuardService.this, "查询包名结束");
+                }
+            }
+        }, "xsd-guard-pkgs").start();
+    }
+
+    /** 逐台设备执行 pm list packages -3，合并所有第三方包名。 */
+    private void queryPackages() {
+        List<GuardPrefs.Dev> devs = new GuardPrefs(this).devices();
+        int on = countOn(devs);
+        AdbCrypto crypto = loadCryptoSafe();
+        if (crypto == null) {
+            GuardLog.i(this, "查询包名失败：本机 ADB 密钥不可用，请先点「重置 ADB 密钥」");
+            GuardState.pkgQueryHint = "密钥不可用，请重置 ADB 密钥后重试";
+            GuardState.set("查询失败", "本机 ADB 密钥不可用");
+            return;
+        }
+        java.util.TreeSet<String> all = new java.util.TreeSet<String>();
+        int okDev = 0;
+        for (GuardPrefs.Dev d : devs) {
+            if (!d.on) continue;
+            String tag = "[" + d.name + "] ";
+            String[] addrs = TvCompat.addresses(d.addr);
+            if (addrs.length == 0) {
+                GuardLog.i(this, tag + "设备地址无效，跳过查询");
+                continue;
+            }
+            boolean got = false;
+            for (String addr : addrs) {
+                AdbClient c = connectWithRetry(TvCompat.host(addr), TvCompat.port(addr), crypto);
+                if (c == null) continue;
+                try {
+                    String out = c.shell("pm list packages -3");
+                    List<String> pkgs = TvCompat.thirdPartyPackages(out);
+                    if (!pkgs.isEmpty() || (out != null && out.trim().length() == 0)) {
+                        all.addAll(pkgs);
+                        got = true;
+                        GuardLog.i(this, tag + "查到 " + pkgs.size() + " 个第三方应用包名");
+                        break;
+                    }
+                    // 有输出但解析不到包名：换候选地址重试
+                    GuardLog.i(this, tag + "包名输出无法识别：" + oneLine(out));
+                } catch (Throwable e) {
+                    GuardLog.i(this, tag + "查询中断：" + TvCompat.logLine(e, addr));
+                } finally {
+                    c.close();
+                }
+            }
+            if (got) okDev++;
+        }
+        List<String> result = new java.util.ArrayList<String>(all);
+        GuardState.thirdPartyPkgs = result;
+        if (okDev == 0) {
+            GuardState.pkgQueryHint = "没有设备返回包名，请确认已连接且 ADB 授权正常";
+            GuardState.set("查询包名失败", GuardState.pkgQueryHint);
+            GuardLog.i(this, "查询包名：没能从任何设备读到包名（共 " + on + " 台启用设备）");
+        } else {
+            GuardState.pkgQueryHint = "共 " + okDev + "/" + on + " 台设备，去重后 " + result.size() + " 个第三方应用";
+            GuardState.set("包名已查询", GuardState.pkgQueryHint);
+            GuardLog.i(this, "查询包名完成：" + GuardState.pkgQueryHint);
+        }
+    }
+
+    private void installAll(String taskId) {
+        List<GuardTask> ts = selectedTasks(taskId);
+        if (ts.isEmpty()) {
+            GuardState.set("没有可安装任务", "请先在「守护任务」里添加并启用一个目标 App");
+            return;
+        }
         List<GuardPrefs.Dev> devs = new GuardPrefs(this).devices();
         AdbCrypto crypto = loadCryptoSafe();
         if (crypto == null) {
@@ -957,38 +1253,41 @@ public class GuardService extends Service {
             return;
         }
         int on = countOn(devs);
-        GuardState.set("准备安装学时兑", "共 " + on + " 台设备");
-        // 先按「下载网址」把安装包拉到本地；本版不再内置安装包，下载失败则无法继续安装
-        String url = new GuardPrefs(this).apkUrl();
-        if (url == null || url.length() == 0) url = APK_URL;
-        File cache = new File(getCacheDir(), APK_ASSET);
-        boolean useCache = false;
-        try {
-            GuardState.set("正在下载安装包", url);
-            downloadApk(cache, url);
-            useCache = true;
-            GuardLog.i(this, "安装包下载完成：" + cache.length() + " 字节（来源：" + url + "）");
-        } catch (Throwable e) {
-            // 下载失败：若本机已有可用缓存，则回退用缓存（更健壮，避免一次网络抖动就装不上）
-            if (cache.isFile() && cache.length() > 100000) {
+        GuardState.set("准备安装任务 App", "共 " + ts.size() + " 个任务 / " + on + " 台设备");
+        for (int ti = 0; ti < ts.size(); ti++) {
+            GuardTask t = ts.get(ti);
+            File cache = new File(getCacheDir(), t.cacheName());
+            boolean useCache = false;
+            try {
+                GuardState.set("正在准备安装包", t.label + " · 来源：" + t.sourceName());
+                File prepared = prepareApk(t);
                 useCache = true;
-                GuardLog.i(this, "下载失败，改用本机已缓存的安装包（" + cache.length()
-                        + " 字节）：" + TvCompat.logLine(e, url));
-            } else {
-                GuardLog.i(this, "下载网址获取失败且无本地缓存（本版无内置安装包，需先确保下载网址可用且手机已联网）："
-                        + TvCompat.logLine(e, url));
-                try { cache.delete(); } catch (Throwable ignored) {}
+                GuardLog.i(this, "安装包就绪：" + t.label + "（" + prepared.length()
+                        + " 字节，来源：" + t.sourceName() + "）");
+            } catch (Throwable e) {
+                // 取包失败但本机有缓存时，仍允许重试（断网 / 本地 URI 暂时失效也能装）
+                if (cache.isFile() && cache.length() > 100000) {
+                    useCache = true;
+                    GuardLog.i(this, "取包失败，改用 " + t.label + " 的缓存包（"
+                            + cache.length() + " 字节）：" + TvCompat.logLine(e, t.sourceValue()));
+                } else {
+                    GuardLog.i(this, t.label + " 取包失败且无缓存：" + TvCompat.logLine(e, t.sourceValue())
+                            + "（网址请确认联网；本地 APK 请重新选择一次）");
+                    continue;
+                }
             }
+            int ok = 0;
+            for (GuardPrefs.Dev d : devs) {
+                if (d.on && installOne(d, crypto, t, cache, useCache)) ok++;
+            }
+            GuardState.set(ok > 0 ? t.label + "安装完成" : t.label + "安装未完成",
+                    ok + "/" + on + " 台成功");
         }
-        int ok = 0;
-        for (GuardPrefs.Dev d : devs) {
-            if (d.on && installOne(d, crypto, useCache)) ok++;
-        }
-        GuardState.set(ok > 0 ? "学时兑安装完成" : "安装未完成", ok + "/" + on + " 台成功");
     }
 
-    private boolean installOne(GuardPrefs.Dev d, AdbCrypto crypto, boolean fromCache) {
-        String tag = "[" + d.name + "] ";
+    private boolean installOne(GuardPrefs.Dev d, AdbCrypto crypto, GuardTask t,
+                               File apkFile, boolean fromCache) {
+        String tag = "[" + d.name + "][" + t.label + "] ";
         String[] addrs = TvCompat.addresses(d.addr);
         if (addrs.length == 0) {
             GuardLog.i(this, tag + "设备地址无效，请填 IP:端口");
@@ -1000,27 +1299,35 @@ public class GuardService extends Service {
             if (c == null) { last = new IOException("连接失败"); continue; }
             try {
                 GuardLog.i(this, tag + "已连接 " + addr + "，推送 APK");
-                GuardState.set("正在推送 APK", d.name);
-                InputStream apk = openApk(fromCache);
-                c.push(apk, REMOTE_APK);
+                GuardState.set("正在推送 APK", t.label + " · " + d.name);
+                InputStream apk = openApk(apkFile);
+                c.push(apk, t.remotePath());
                 apk.close();
                 GuardLog.i(this, tag + "APK 已推送，执行安装");
-                GuardState.set("正在安装学时兑", d.name);
+                GuardState.set("正在安装 " + t.label, d.name);
                 c.setReadTimeout(90000);   // pm install 可能超过默认 30 秒才回输出
-                String out = c.shell(TvCompat.installCommand(REMOTE_APK));
+                String out = c.shell(TvCompat.installCommand(t.remotePath()));
                 c.setReadTimeout(30000);
                 android.util.Log.i("XsdGuard", tag + "install out: " + oneLine(out));
                 if (!TvCompat.installFailed(out)) {
                     // 重装会清掉运行时权限：装完立即检测并补齐全部必需权限
-                    // （悬浮窗 / 电池白名单 / 自启 / 防休眠），否则服务会被系统拒绝前台化
-                    ensureTvPermissions(c, tag);
-                    GuardLog.i(this, tag + "已自动开通学时兑必需权限（悬浮窗 / 电池白名单 / 自启 / 防休眠）");
-                    for (String lc : TvCompat.launchCommands(PKG)) {
-                        try { c.shell(lc); } catch (Exception ignored) {}
+                    if (t.autoGrant()) {
+                        ensureTvPermissions(c, tag, t);
+                        if ("学时兑".equals(t.label)) {
+                            GuardLog.i(this, tag + "已自动开通学时兑必需权限（悬浮窗 / 电池白名单 / 自启 / 防休眠）");
+                        } else {
+                            GuardLog.i(this, tag + "已自动开通 " + t.label
+                                    + " 必需权限（悬浮窗 / 电池白名单 / 自启 / 防休眠）");
+                        }
                     }
-                    GuardLog.i(this, tag + "学时兑已安装 / 更新并启动");
-                    // v2.13：装完后状态立即转为已安装，之后可跳过安装直接守护
-                    GuardState.tvInstalled = 1;
+                    if (t.autoLaunch()) {
+                        for (String lc : TvCompat.launchCommands(t.pkg)) {
+                            try { c.shell(lc); } catch (Exception ignored) {}
+                        }
+                    }
+                    GuardLog.i(this, tag + t.label + "已安装 / 更新"
+                            + (t.autoLaunch() ? "并启动" : ""));
+                    GuardState.setTaskInstalled(t.id, 1);
                     GuardState.fire();
                     return true;
                 }
@@ -1033,11 +1340,16 @@ public class GuardService extends Service {
                 c.close();
             }
         }
-        GuardState.set("安装失败", TvCompat.explain(last, d.addr).hint);
+        GuardState.set("安装失败", t.label + " · " + TvCompat.explain(last, d.addr).hint);
         return false;
     }
 
-    private void grantAll() {
+    private void grantAll(String taskId) {
+        List<GuardTask> ts = selectedTasks(taskId);
+        if (ts.isEmpty()) {
+            GuardState.set("没有可授权任务", "请先在「守护任务」里添加并启用一个目标 App");
+            return;
+        }
         List<GuardPrefs.Dev> devs = new GuardPrefs(this).devices();
         AdbCrypto crypto = loadCryptoSafe();
         if (crypto == null) {
@@ -1045,16 +1357,20 @@ public class GuardService extends Service {
             return;
         }
         int on = countOn(devs);
-        GuardState.set("准备开通权限", "共 " + on + " 台设备");
-        int ok = 0;
-        for (GuardPrefs.Dev d : devs) {
-            if (d.on && grantOne(d, crypto)) ok++;
+        GuardState.set("准备开通权限", "共 " + ts.size() + " 个任务 / " + on + " 台设备");
+        for (int ti = 0; ti < ts.size(); ti++) {
+            GuardTask t = ts.get(ti);
+            int ok = 0;
+            for (GuardPrefs.Dev d : devs) {
+                if (d.on && grantOne(d, crypto, t)) ok++;
+            }
+            GuardState.set(ok > 0 ? t.label + "权限已开通" : t.label + "授权未完成",
+                    ok + "/" + on + " 台成功");
         }
-        GuardState.set(ok > 0 ? "权限已开通" : "授权未完成", ok + "/" + on + " 台成功");
     }
 
-    private boolean grantOne(GuardPrefs.Dev d, AdbCrypto crypto) {
-        String tag = "[" + d.name + "] ";
+    private boolean grantOne(GuardPrefs.Dev d, AdbCrypto crypto, GuardTask t) {
+        String tag = "[" + d.name + "][" + t.label + "] ";
         String[] addrs = TvCompat.addresses(d.addr);
         if (addrs.length == 0) {
             GuardLog.i(this, tag + "设备地址无效，请填 IP:端口");
@@ -1065,28 +1381,28 @@ public class GuardService extends Service {
             AdbClient c = connectWithRetry(TvCompat.host(addr), TvCompat.port(addr), crypto);
             if (c == null) { last = new IOException("连接失败"); continue; }
             try {
-                // 先取设备 Android 版本，按版本跳过老系统不支持的通知等命令
                 int sdk = 0;
                 try {
                     sdk = Integer.parseInt(oneLine(c.shell("getprop ro.build.version.sdk")).trim());
                 } catch (Exception ignored) {}
                 if (sdk > 0) GuardLog.i(this, tag + "设备 Android SDK " + sdk);
-                String[] cmds = TvCompat.permissionCommands(PKG, sdk);
+                String[] cmds = TvCompat.permissionCommands(t.pkg, sdk);
                 for (String cmd : cmds) {
                     String out = null;
                     try { out = c.shell(cmd); }
                     catch (Exception e) { out = "(异常)"; }
                     GuardLog.i(this, tag + cmd + " → " + oneLine(out));
                 }
-                // 复核悬浮窗（答题浮层）权限是否真正放行（仅作提示，不阻断结果）
                 String chk = null;
-                try { chk = c.shell("appops get " + PKG + " SYSTEM_ALERT_WINDOW"); }
+                try { chk = c.shell("appops get " + t.pkg + " SYSTEM_ALERT_WINDOW"); }
                 catch (Exception ignored) {}
                 boolean overlayOk = (chk != null && chk.toLowerCase().contains("allow"));
                 GuardLog.i(this, tag + "悬浮窗权限："
                         + (overlayOk ? "已允许" : "未确认（部分 ROM 需到系统设置手动允许）")
                         + (chk != null ? ("（" + oneLine(chk) + "）") : ""));
-                GuardState.set("权限已开通", d.name);
+                // 手动授权也顺手补齐前台服务 / 电池白名单，避免只开一半
+                ensureTvPermissions(c, tag, t);
+                GuardState.set("权限已开通", t.label + " · " + d.name);
                 return true;
             } catch (Throwable e) {
                 last = e;
@@ -1095,16 +1411,15 @@ public class GuardService extends Service {
                 c.close();
             }
         }
-        GuardState.set("授权失败", TvCompat.explain(last, d.addr).hint);
+        GuardState.set("授权失败", t.label + " · " + TvCompat.explain(last, d.addr).hint);
         return false;
     }
 
-    /** 取 APK：仅用从「下载网址」拉取到本地的缓存文件；无缓存则明确报错（已取消内置包）。 */
-    private InputStream openApk(boolean fromCache) throws Exception {
-        File cache = new File(getCacheDir(), APK_ASSET);
-        if (fromCache && cache.isFile() && cache.length() > 100000)
-            return new FileInputStream(cache);
-        throw new IOException("安装包未下载，请确认下载网址可用且手机已联网后重试");
+    /** 取 APK：从任务准备好的本机缓存文件读取；两种来源最终都落到这个文件。 */
+    private InputStream openApk(File apkFile) throws Exception {
+        if (apkFile != null && apkFile.isFile() && apkFile.length() > 100000)
+            return new FileInputStream(apkFile);
+        throw new IOException("安装包未准备好，请检查下载网址或重新选择本地 APK");
     }
 
     private void downloadApk(File cache, String url) throws Exception {
@@ -1316,10 +1631,13 @@ public class GuardService extends Service {
         stopSelf();
     }
 
-    /** 兼容 API 26+ 的后台启动限制：优先反射 startForegroundService。 */
-    static void start(Context c, String action) {
+    static void start(Context c, String action) { start(c, action, null); }
+
+    /** v3：指定 taskId 时只对该任务执行安装 / 授权；null 表示全部已启用任务。 */
+    static void start(Context c, String action, String taskId) {
         Intent i = new Intent(c, GuardService.class);
         i.setAction(action);
+        if (taskId != null) i.putExtra("taskId", taskId);
         if (Build.VERSION.SDK_INT >= 26) {
             try {
                 java.lang.reflect.Method m =

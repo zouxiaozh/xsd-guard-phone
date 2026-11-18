@@ -1,8 +1,8 @@
 <?xml version="1.0" encoding="utf-8"?>
 <manifest xmlns:android="http://schemas.android.com/apk/res/android"
     package="com.xsdanser.guard"
-    android:versionCode="19"
-    android:versionName="2.14.3">
+    android:versionCode="27"
+    android:versionName="3.7">
 
   <!-- 21 = Android 5.0：覆盖绝大多数智能电视 / 盒子的系统版本 -->
   <uses-sdk android:minSdkVersion="21" android:targetSdkVersion="28" />

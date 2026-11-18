@@ -60,7 +60,7 @@ final class TvCompat {
         }
         if (t.contains("unknownhost") || t.contains("not associated") || t.contains("unresolved")) {
             return new Err("地址无效",
-                "设备列表里的地址填错了（" + addr + "），请改成 IP:端口，例如 192.168.1.100:5555。");
+                "设备列表里的地址填错了（" + addr + "），请改成 IP:端口，例如 192.168.31.9:5555。");
         }
         if (t.contains("enonet") || t.contains("network is unreachable")
                 || t.contains("network unavailable")) {
@@ -305,6 +305,25 @@ final class TvCompat {
 
     static boolean packageInstalled(String pmOut) {
         return pmOut != null && pmOut.contains("package:");
+    }
+
+    /**
+     * v3.1：解析 `pm list packages -3` 输出，取出每行 `package:xxx` 的包名，
+     * 去重并排序。数据流 / 空输出都返回空表，调用方负责提示。
+     */
+    static java.util.List<String> thirdPartyPackages(String pmOut) {
+        java.util.TreeSet<String> set = new java.util.TreeSet<String>();
+        if (pmOut != null) {
+            String[] lines = pmOut.split("[\\r\\n]+");
+            for (int i = 0; i < lines.length; i++) {
+                String s = lines[i].trim();
+                if (s.startsWith("package:")) {
+                    String p = s.substring(8).trim();
+                    if (p.length() > 0 && p.indexOf(' ') < 0) set.add(p);
+                }
+            }
+        }
+        return new java.util.ArrayList<String>(set);
     }
 
     /**
